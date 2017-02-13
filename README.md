@@ -31,6 +31,9 @@ sync_log start /var/log/nginx/access.log /tmp/nginx/access.log.d /mnt/nfs/nginx/
 
 # stop sync_log
 # sync_log stop /tmp/nginx/access.log.d
+
+# help
+# sync_log -h
 ```
 ## VM-2(IP: 192.168.3.20)
 ```
@@ -49,6 +52,9 @@ merge_log /nfs nginx/access.log.d access.log --ips=192.168.3.10
 
 # stop merge_log
 # Ctrl + C
+
+# help
+# merge_log -h
 ```
 
 # Any Question
