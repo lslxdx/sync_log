@@ -1,0 +1,72 @@
+#!/bin/bash
+
+show_usage(){
+  echo 'Invalid argument list. Usage:'
+  echo -n 'merge_log <root_dir> <sub_dir> <dst_file_name>'
+  echo ' --ips=<ip>[,<ip>...]'
+  # ./merge_log /nfs nginx/error.log.d error.log --ips=192.168.3.20,192.168.3.30&
+}
+
+IPS=()
+IPS_LEN=${#IPS[@]}
+CHECK_INTERVAL_SEC=5
+
+show_header(){
+  echo "ROOT_DIR[$ROOT_DIR], SUB_DIR[$SUB_DIR], DST_FILE_NAME[$DST_FILE_NAME], IPS[${IPS[@]}]"
+}
+
+parse_options(){
+  local opt
+  for opt in "$@"
+  do
+    case $opt in
+      --ips=*)
+        if [ -n "$(echo "${opt#*=}"|tr ',' ' ')" ] 
+        then
+          IPS=($(echo "${opt#*=}"|tr ',' ' '))
+          IPS_LEN=${#IPS[@]}
+        else
+          show_usage
+          exit 1
+        fi
+        ;;
+      *)
+        echo "Not supported options: $opt"
+        ;;
+    esac
+  done
+}
+
+main(){
+  if [ $# -lt 3 ] || [ ! -r $1 ] || [ -z "$2" ] || [ -z "$3" ]
+  then
+    show_usage
+    exit 1
+  fi
+  ROOT_DIR="$(cd $(dirname $1); pwd)/$(basename $1)"
+  SUB_DIR="$2"
+  DST_FILE_NAME="$3"
+  shift 3
+
+  parse_options "$@"
+  if [[ $IPS_LEN < 1 ]]; then show_usage; exit 1; fi
+  show_header
+
+  local part_file
+  local part_files
+  while :
+  do
+    for((idx=0; idx<$IPS_LEN; idx++))
+    do
+      part_files=$(find $ROOT_DIR/${IPS[$idx]}/$SUB_DIR ! -name '*.tmp' -a ! -name "$DST_FILE_NAME" -a ! -name '.*' -a -type f)
+      for part_file in ${part_files[@]}
+      do
+        cat $part_file >> $ROOT_DIR/${IPS[$idx]}/$SUB_DIR/$DST_FILE_NAME && rm -rf $part_file
+      done
+    done
+    sleep $CHECK_INTERVAL_SEC
+  done
+}
+
+main "$@"
+

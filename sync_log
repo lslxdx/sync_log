@@ -1,0 +1,360 @@
+#!/bin/bash
+
+show_usage(){
+  local usage=${1:-all}
+  echo 'Invalid argument list. Usage:'
+  if [[ $usage = 'start' || $usage = 'all' ]]
+  then
+    echo 'sync_log start <src_file> <tmp_dir> <dst_dir> <check_interval_sec>'
+    echo '  |-<data_flow>         : <src_file> => <tmp_dir/tmp/*> => <dst_dir>'
+    echo '  |-<check_interval_sec>: temporary files are created every <check_interval_sec> seconds'
+    echo
+  fi
+  if [[ $usage = 'stop' || $usage = 'all' ]]
+  then
+    echo 'sync_log stop <tmp_dir>'
+    echo
+  fi
+  if [[ $usage = 'killall' || $usage = 'all' ]]
+  then
+    echo 'sync_log killall'
+    echo
+  fi
+}
+
+pid_count(){
+  echo $(ps -ef | grep "$1"| grep -v grep | wc -l)
+}
+
+timestamp_sec(){
+  echo $(date +%s)
+}
+
+sed_pgid_file(){
+  if [ $(uname) = 'Linux' ]
+  then
+    sed -i "/^$1\$/d" $PGID_FILE
+  else
+    sed -i '' "/^$1\$/d" $PGID_FILE
+  fi
+}
+
+sed_tmp_inode_name_file(){
+  if [ $(uname) = 'Linux' ]
+  then
+    sed -i "/^$1\$/d" $TMP_INODE_NAME_FILE
+  else
+    sed -i '' "/^$1\$/d" $TMP_INODE_NAME_FILE
+  fi
+}
+
+gen_pgid_file_from_tmp_dir(){
+  echo "$TMP_DIR/bg.pid"
+}
+
+pgid_of_pid(){
+  ps -o pgid= $1 | grep -o '[0-9]*'
+}
+
+pid_pgid_comm_of_ppid(){
+  local pid
+  local pgid
+  local ppid
+  local comm
+  local target_ppid=${1:-1}
+  if [ $(uname) = 'Linux' ]
+  then
+    ps --ppid "$target_ppid" -o pid= -o pgid= -o comm=
+  else
+    ps -e -o pid= -o pgid= -o ppid= -o comm=| while read pid pgid ppid comm
+    do
+      if [ "$ppid" = "$target_ppid" ]
+      then
+       echo $pid $pgid $comm
+      fi
+    done
+  fi
+}
+
+kill_pgid(){
+  echo "Kill Process Group ID[$1]"
+  if [ -n "$1" ]
+  then
+    local pid
+    local pgid
+    if [ $(uname) = 'Linux' ]
+    then
+      kill -9 -$1
+    else
+      ps -e -o pid= -o pgid=| while read pid pgid
+      do
+        if [ "$pgid" = "$1" ]
+        then
+          kill -9 $pid
+        fi
+      done
+    fi
+  fi
+}
+
+kill_orphan_tail(){
+  local orphan_pgid=${1:-$PGID}
+  local pid
+  local pgid
+  local comm
+  pid_pgid_comm_of_ppid '1'| while read pid pgid comm
+  do
+    if [ "$orphan_pgid" = "$pgid" -a "$comm" = "tail" ]
+    then
+      echo "kill_orphan_tail pid[$pid]"
+      pkill -9 -P $pid
+      kill -9 $pid
+    fi
+  done
+}
+
+kill_aged_mv(){
+  local pgid=${1:-$PGID}
+  local pid
+  local comm
+  local etime
+
+  pgrep -g "$pgid"|xargs -I {} ps -p {} -o pid= -o comm= -o etime=| while read pid comm etime
+  do
+    if [[ "$comm" = "mv" && (${#etime} > 5 || "$etime" > "$MAX_MV_AGE") ]]
+    then
+      echo "kill_aged_mv pid[$pid]"
+      kill -9 $pid
+    fi
+  done
+}
+
+kill_bg_pids(){
+  local pgid
+  for pgid in $(cat $PGID_FILE)
+  do
+    kill_pgid "$pgid"
+  done
+  echo -n ''>$PGID_FILE
+}
+
+is_tailing_tmp_file_of_inode(){
+  if [ -n "$1" ]
+  then
+    if grep "^$1 " "$TMP_INODE_NAME_FILE" &>/dev/null; then echo '1'; else echo '0'; fi;
+  else
+    echo '0'
+  fi
+}
+
+is_tailing_tmp_file_of_name(){
+  if [ -n "$1" ]
+  then
+    if grep " $1$" "$TMP_INODE_NAME_FILE" &>/dev/null; then echo '1'; else echo '0'; fi;
+  else
+    echo '0'
+  fi
+}
+
+is_tail_prepared(){
+  if [ -n "$1" ]
+  then
+    if [ -n "$(lsof -c tail -a "$1" "$SRC_FILE"|awk 'NR>1{print $2}'|uniq -d)" ]; then echo '1'; else echo '0'; fi;
+  else
+    echo '0'
+  fi
+}
+
+tail_from_src(){
+  if [ $# -lt 1 ];then return 1;fi
+  local tmp_file_name="$1"
+
+  {
+    while [ "$(is_tailing_tmp_file_of_name "$tmp_file_name")" = "1" ] # !!! IMPORTANT !!!
+    do
+      if [ -r "$SRC_FILE" ]
+      then
+        if [ -w "$tmp_file_name" ]
+        then
+          tail -F -n 0 "$SRC_FILE">>"$tmp_file_name"
+        else
+          echo "tmp_file_name[$tmp_file_name] cannot be written to, wait for [$FROM_SRC_ERROR_SEC] sec..."
+          sleep $FROM_SRC_ERROR_SEC
+        fi
+      else
+        echo "SRC_FILE[$SRC_FILE] cannot be read, wait for [$FROM_SRC_ERROR_SEC] sec..."
+        sleep $FROM_SRC_ERROR_SEC
+      fi
+    done
+
+    mv_to_dst
+  } 2>/dev/null&
+  FROM_SRC_PID=$!
+  echo "FROM_SRC_PID[$FROM_SRC_PID]"
+}
+
+mv_to_dst(){
+  local f
+  for f in $(cd "$TMP_FILE_D"; find . -type f)
+  do
+    if [ "$(is_tailing_tmp_file_of_inode "$(ls -i "$TMP_FILE_D/$f"|awk '{print $1}')")" = '0' ]
+    then
+      /bin/mv -f $TMP_FILE_D/$f $DST_DIR/${f}.tmp && /bin/mv -f $DST_DIR/$f{.tmp,}
+    fi
+  done
+}
+
+guard_from_src(){
+  local tmp_file_name="$TMP_FILE_D/$(date $DATE_FORMAT)"
+  local prev_from_src_pid=$FROM_SRC_PID
+  touch "$tmp_file_name"
+  local inode_name="$(ls -i "$tmp_file_name")"
+  echo "$inode_name">>"$TMP_INODE_NAME_FILE"
+  tail_from_src "$tmp_file_name" && while [ "$(is_tail_prepared "$tmp_file_name")" = '0' ]
+  do
+    echo "no content..."; sleep 0.001; 
+  done
+  echo "$inode_name">"$TMP_INODE_NAME_FILE"
+
+  if [ -n "$prev_from_src_pid" ]
+  then
+    pkill -9 -P $prev_from_src_pid
+  fi
+}
+
+sync_start(){
+  echo "IMPORTANT: If you terminate this script by 'kill -9' or 'kill SIGKILL', you MUST kill pgids in <pgid_file> MANUALLY!"
+  echo "<src_file>          : [$SRC_FILE]"
+  echo "<tmp_dir>           : [$TMP_DIR]"
+  echo "<dst_dir>           : [$DST_DIR]"
+  echo "<tmp_file_d>        : [$TMP_FILE_D]"
+  echo "<pgid_file>         : [$PGID_FILE]"
+  echo "<check_interval_sec>: [$CHECK_INTERVAL_SEC]"
+  echo "<pid>               : [$$]"
+  echo "<data_flow>         : [$SRC_FILE] => [$TMP_FILE_D/*] => [$DST_DIR]"
+  echo "<max_mv_age>        : [$MAX_MV_AGE]"
+  echo ''
+
+  cd $TMP_DIR && touch $PGID_FILE && kill_bg_pids # if `sync_log` is run on the same `$TMP_DIR`, the former one will be killed
+  echo "$PGID" >> "$PGID_FILE"                    # save `PGID` to `$PGID_FILE`
+  trap "kill_bg_pids" EXIT                        # kill all background PIDs on `EXIT`(`kill -9` is NOT included)
+
+  while :
+  do
+    guard_from_src
+    kill_orphan_tail
+    kill_aged_mv
+    sleep $CHECK_INTERVAL_SEC
+  done
+}
+
+sync_stop(){
+  echo "Kill Process Group from: [$PGID_FILE]"
+  echo "<tmp_dir>              : [$TMP_DIR]"
+  echo "<pid>                  : [$$]"
+  echo ''
+
+  if [ ! -r "$PGID_FILE" ]
+  then
+    echo "Cannot read $PGID_FILE"
+    exit 1
+  fi
+
+  local pgid
+  for pgid in $(cat $PGID_FILE)
+  do
+    kill_pgid "$pgid"
+    #echo "kill pgid[$pgid]!!!"
+  done
+  echo -n ''>$PGID_FILE
+}
+
+sync_killall(){
+  echo 'Kill all processes according to the implied <tmp_dir>/bg.pid!'
+  local pgid
+  local tmp_dir
+  ps -o pgid= -o cmd= $(ps -ef|grep 'sync_log start'|awk '{print $2}')|sort|uniq|awk '{print $1,$6}'|while read pgid tmp_dir
+  do
+    if [ -n "$pgid" -a "$PGID" != "$pgid" ]
+    then
+      TMP_DIR="$tmp_dir"
+      PGID_FILE=$(gen_pgid_file_from_tmp_dir)
+      sync_stop
+    else
+      echo "Skip pgid[$pgid]"
+    fi
+  done
+  echo "Done"
+}
+
+main(){
+  case "$1" in
+    'start'):
+      if [ $# -ge 5 ]
+      then
+        MIN_CHECK_INTERVAL_SEC=20
+        MAX_MV_AGE='05:00'
+
+        if [ ! -r $2 ]; then echo "Cannot read <src_file>[$2]"; exit 1; fi
+        if [ ! -w $3 ]; then echo "Cannot write <tmp_dir>[$3]"; exit 1; fi
+        if [ ! -w $4 ]; then echo "Cannot write <dst_dir>[$4]"; exit 1; fi
+        if [ -n "$(echo $5|sed 's/[0-9]//g')" ]; then echo "<check_interval_sec>[$5] must be number"; exit 1; fi
+        if [ $5 -lt $MIN_CHECK_INTERVAL_SEC ]; then echo "<check_interval_sec>[$5] must >= $MIN_CHECK_INTERVAL_SEC"; exit 1; fi
+
+        SRC_FILE=$(cd $(dirname $2); pwd)/$(basename $2)
+        TMP_DIR=$(cd $(dirname $3); pwd)/$(basename $3)
+        DST_DIR=$(cd $(dirname $4); pwd)/$(basename $4)
+        SRC_BASENAME=$(basename $SRC_FILE)
+        TMP_FILE_D=$TMP_DIR/tmp
+        FROM_SRC_PID=
+        PGID_FILE=$TMP_DIR/bg.pid
+        TMP_INODE_NAME_FILE=$TMP_DIR/tmp.in
+        DATE_FORMAT='+%m%dT%H%M%S'
+        FROM_SRC_ERROR_SEC=10
+        CHECK_INTERVAL_SEC=$5
+
+        TEST=0
+        if [ "$TEST" = '1' ]
+        then
+          FROM_SRC_ERROR_SEC=1
+          CHECK_INTERVAL_SEC=5
+        fi
+
+        mkdir -p $TMP_FILE_D
+        if [ ! -w $TMP_FILE_D ]; then echo "Cannot write <tmp_file_d>[$TMP_FILE_D]"; exit 1; fi
+        
+        sync_start
+      else
+        show_usage 'start'
+        exit 1
+      fi;;
+    'stop'):
+      if [ $# -ge 2 ]
+      then
+        if [ ! -r $2 ]; then echo "Cannot read <tmp_dir>[$2]"; exit 1; fi
+        TMP_DIR=$(cd $(dirname $2); pwd)/$(basename $2)
+        PGID_FILE=$(gen_pgid_file_from_tmp_dir)
+        sync_stop
+      else
+        show_usage 'stop'
+        exit 1
+      fi;;
+    'killall'):
+      if [ $# -ge 1 ]
+      then
+        sync_killall
+      else
+        show_usage 'killall'
+        exit 1
+      fi;;
+    *):
+      show_usage
+      exit 1;;
+  esac
+}
+
+# rm -rf src tmp dst; ./sync_log start src tmp dst 20
+# ./sync_log stop tmp
+PGID=$(ps -o pgid= $$)
+main "$@"&
+
